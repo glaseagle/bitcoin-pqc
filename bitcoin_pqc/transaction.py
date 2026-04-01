@@ -1,23 +1,22 @@
 """
-Post-quantum transaction construction, signing, and verification.
+Transaction construction, signing, and verification.
 
-A PQTransaction mirrors Bitcoin's raw transaction structure with one key
-difference in the witness / scriptSig field: instead of a DER-encoded ECDSA
-signature + compressed pubkey (typically ~107 bytes), the unlocking data is:
+Supports both P2PQH (pure ML-DSA) and P2HPQ (hybrid ECDSA + ML-DSA) inputs.
 
-  <ml_dsa_signature>  <ml_dsa_public_key>
+scriptSig format
+----------------
+P2PQH (pure PQ):
+  <varint sig_len> <mldsa_sig> <varint pk_len> <mldsa_pubkey>
 
-Sizes at ML-DSA-65:
-  Signature : 3293 bytes
-  Public key: 1952 bytes
-  Total      : 5245 bytes  (vs ~107 bytes for ECDSA)
+P2HPQ (hybrid):
+  <varint data_len> <hybrid_serialised>
+  where hybrid_serialised = HybridSignature.serialise() —
+    2B ecdsa_sig_len | ecdsa_sig | 2B ecdsa_pk_len | ecdsa_pk |
+    2B mldsa_sig_len | mldsa_sig | 2B mldsa_pk_len | mldsa_pk
 
-This is intentionally large — the trade-off is quantum resistance.  Future
-work includes aggregated/batch verification and Winternitz OTS for cases
-where smaller proofs are critical.
-
-Transaction serialisation follows Bitcoin's little-endian conventions.
-The sighash (message signed) is SHA-256(SHA-256(serialised_tx_body)).
+Sighash
+-------
+SHA256(SHA256(serialised_tx_body_with_empty_scriptsigs))
 """
 
 from __future__ import annotations
@@ -25,10 +24,14 @@ from __future__ import annotations
 import hashlib
 import struct
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import List, Union
 
-from .keys import PQKeyPair, SecurityLevel, verify_with_pubkey
-from .address import address_to_script_pubkey
+from .keys import PQKeyPair, HybridKeyPair, HybridSignature, SecurityLevel, verify_mldsa, _verify_ecdsa
+from .address import address_to_script_pubkey, is_hybrid_address
+from .exceptions import TransactionError, ScriptSigParseError
+
+
+KeyType = Union[PQKeyPair, HybridKeyPair]
 
 
 # ---------------------------------------------------------------------------
@@ -37,25 +40,33 @@ from .address import address_to_script_pubkey
 
 @dataclass
 class TxInput:
-    prev_txid: bytes        # 32 bytes, little-endian
-    prev_index: int         # uint32
-    script_sig: bytes = b"" # empty for unsigned; filled with PQ witness on sign
+    prev_txid: bytes
+    prev_index: int
+    script_sig: bytes = b""
     sequence: int = 0xFFFFFFFF
+    _is_hybrid: bool = False
 
-    def serialise(self) -> bytes:
+    def serialise(self, empty_script: bool = False) -> bytes:
+        script = b"" if empty_script else self.script_sig
         return (
-            self.prev_txid[::-1]           # stored big-endian → flip to LE
+            self.prev_txid[::-1]
             + struct.pack("<I", self.prev_index)
-            + _varint(len(self.script_sig))
-            + self.script_sig
+            + _varint(len(script))
+            + script
             + struct.pack("<I", self.sequence)
         )
 
 
 @dataclass
 class TxOutput:
-    value: int              # satoshis (uint64)
-    script_pubkey: bytes    # locking script
+    value: int
+    script_pubkey: bytes
+
+    def __post_init__(self) -> None:
+        if self.value < 0:
+            raise TransactionError("Output value cannot be negative")
+        if self.value > 21_000_000 * 100_000_000:
+            raise TransactionError("Output value exceeds maximum Bitcoin supply")
 
     def serialise(self) -> bytes:
         return (
@@ -73,17 +84,23 @@ class PQTransaction:
     locktime: int = 0
 
     # ------------------------------------------------------------------
-    # Convenience builders
+    # Builders
     # ------------------------------------------------------------------
 
     def add_input(
         self,
-        prev_txid: str | bytes,
+        prev_txid: Union[str, bytes],
         prev_index: int,
         sequence: int = 0xFFFFFFFF,
     ) -> "PQTransaction":
         if isinstance(prev_txid, str):
+            if len(prev_txid) != 64:
+                raise TransactionError("TXID must be 64 hex characters")
             prev_txid = bytes.fromhex(prev_txid)
+        if len(prev_txid) != 32:
+            raise TransactionError("TXID must be 32 bytes")
+        if not 0 <= prev_index <= 0xFFFFFFFF:
+            raise TransactionError("Output index out of range")
         self.inputs.append(TxInput(prev_txid=prev_txid, prev_index=prev_index, sequence=sequence))
         return self
 
@@ -101,94 +118,110 @@ class PQTransaction:
     # ------------------------------------------------------------------
 
     def serialise(self, signing: bool = False) -> bytes:
-        """Full transaction serialisation.  signing=True omits scriptSigs."""
+        if not self.inputs:
+            raise TransactionError("Transaction has no inputs")
+        if not self.outputs:
+            raise TransactionError("Transaction has no outputs")
         parts = [struct.pack("<I", self.version)]
         parts.append(_varint(len(self.inputs)))
         for inp in self.inputs:
-            if signing:
-                # Empty scriptSig for sighash computation
-                bare = TxInput(
-                    prev_txid=inp.prev_txid,
-                    prev_index=inp.prev_index,
-                    script_sig=b"",
-                    sequence=inp.sequence,
-                )
-                parts.append(bare.serialise())
-            else:
-                parts.append(inp.serialise())
+            parts.append(inp.serialise(empty_script=signing))
         parts.append(_varint(len(self.outputs)))
         for out in self.outputs:
             parts.append(out.serialise())
         parts.append(struct.pack("<I", self.locktime))
         return b"".join(parts)
 
+    def sighash(self) -> bytes:
+        raw = self.serialise(signing=True)
+        return hashlib.sha256(hashlib.sha256(raw).digest()).digest()
+
     def txid(self) -> str:
-        """TXID = hex(SHA256(SHA256(serialised_tx)))[::-1]"""
         raw = self.serialise()
         h = hashlib.sha256(hashlib.sha256(raw).digest()).digest()
         return h[::-1].hex()
 
-    def sighash(self) -> bytes:
-        """The message that gets signed: SHA256(SHA256(tx_body_without_sigs))."""
-        raw = self.serialise(signing=True)
-        return hashlib.sha256(hashlib.sha256(raw).digest()).digest()
+    def total_output_value(self) -> int:
+        return sum(o.value for o in self.outputs)
+
+    def weight(self) -> int:
+        """Approximate transaction weight (vbytes ≈ weight / 4)."""
+        return len(self.serialise())
 
 
 # ---------------------------------------------------------------------------
 # Sign / verify
 # ---------------------------------------------------------------------------
 
-def sign_transaction(tx: PQTransaction, keypairs: List[PQKeyPair]) -> PQTransaction:
+def sign_transaction(tx: PQTransaction, keypairs: List[KeyType]) -> PQTransaction:
     """
-    Sign each input with the corresponding keypair.
+    Sign all inputs.  Pass one keypair per input, or a single-element list
+    to use the same key for all inputs.
 
-    keypairs[i] signs inputs[i].  Pass a single-element list to sign all
-    inputs with the same key (unusual but valid for testing).
+    Accepts PQKeyPair (pure ML-DSA) or HybridKeyPair (ECDSA + ML-DSA).
     """
+    if not keypairs:
+        raise TransactionError("No keypairs provided")
     if len(keypairs) == 1:
         keypairs = keypairs * len(tx.inputs)
     if len(keypairs) != len(tx.inputs):
-        raise ValueError(
-            f"Need one keypair per input: {len(tx.inputs)} inputs, "
-            f"{len(keypairs)} keypairs"
+        raise TransactionError(
+            f"{len(tx.inputs)} inputs but {len(keypairs)} keypairs provided"
         )
 
     msg = tx.sighash()
 
     for inp, kp in zip(tx.inputs, keypairs):
-        sig = kp.sign(msg)
-        # scriptSig = <varint sig_len> <sig> <varint pubkey_len> <pubkey>
-        inp.script_sig = (
-            _varint(len(sig)) + sig
-            + _varint(len(kp.public_key)) + kp.public_key
-        )
+        if isinstance(kp, HybridKeyPair):
+            sig = kp.sign(msg)
+            serialised = sig.serialise()
+            inp.script_sig = _varint(len(serialised)) + serialised
+            inp._is_hybrid = True
+        elif isinstance(kp, PQKeyPair):
+            sig = kp.sign(msg)
+            inp.script_sig = _varint(len(sig)) + sig + _varint(len(kp.public_key)) + kp.public_key
+            inp._is_hybrid = False
+        else:
+            raise TransactionError(f"Unknown keypair type: {type(kp)}")
 
     return tx
 
 
-def verify_transaction(tx: PQTransaction, level: SecurityLevel = SecurityLevel.ML_DSA_65) -> bool:
+def verify_transaction(
+    tx: PQTransaction,
+    level: SecurityLevel = SecurityLevel.ML_DSA_65,
+) -> bool:
     """
-    Verify all input signatures in a signed transaction.
+    Verify all input signatures.
 
-    Extracts the ML-DSA public key and signature from each scriptSig,
-    then checks against the transaction sighash.
+    For hybrid inputs, BOTH ECDSA and ML-DSA must be valid.
+    For pure PQ inputs, ML-DSA must be valid.
     """
+    if not tx.inputs:
+        raise TransactionError("Transaction has no inputs")
+
     msg = tx.sighash()
 
     for i, inp in enumerate(tx.inputs):
+        if not inp.script_sig:
+            raise TransactionError(f"Input {i} has no scriptSig (unsigned)")
         try:
-            sig, pubkey = _parse_script_sig(inp.script_sig)
-        except Exception as e:
-            raise ValueError(f"Input {i}: failed to parse scriptSig: {e}") from e
-
-        if not verify_with_pubkey(pubkey, msg, sig, level):
-            return False
+            if inp._is_hybrid:
+                sig = _parse_hybrid_scriptsig(inp.script_sig, level)
+                if not sig.verify(msg):
+                    return False
+            else:
+                mldsa_sig, mldsa_pk = _parse_pq_scriptsig(inp.script_sig)
+                if not verify_mldsa(mldsa_pk, msg, mldsa_sig, level):
+                    return False
+        except ScriptSigParseError as exc:
+            raise TransactionError(f"Input {i}: {exc}") from exc
 
     return True
 
 
 # ---------------------------------------------------------------------------
-# Internal helpers
+# Helpers
 # ---------------------------------------------------------------------------
 
 def _varint(n: int) -> bytes:
@@ -203,7 +236,8 @@ def _varint(n: int) -> bytes:
 
 
 def _read_varint(data: bytes, offset: int) -> tuple[int, int]:
-    """Return (value, new_offset)."""
+    if offset >= len(data):
+        raise ScriptSigParseError("Unexpected end of data reading varint")
     first = data[offset]
     if first < 0xFD:
         return first, offset + 1
@@ -215,12 +249,23 @@ def _read_varint(data: bytes, offset: int) -> tuple[int, int]:
         return struct.unpack_from("<Q", data, offset + 1)[0], offset + 9
 
 
-def _parse_script_sig(script_sig: bytes) -> tuple[bytes, bytes]:
-    """Extract (signature, public_key) from a P2PQH scriptSig."""
-    offset = 0
-    sig_len, offset = _read_varint(script_sig, offset)
-    sig = script_sig[offset: offset + sig_len]
-    offset += sig_len
-    pk_len, offset = _read_varint(script_sig, offset)
-    pubkey = script_sig[offset: offset + pk_len]
-    return sig, pubkey
+def _parse_pq_scriptsig(script_sig: bytes) -> tuple[bytes, bytes]:
+    try:
+        offset = 0
+        sig_len, offset = _read_varint(script_sig, offset)
+        sig = script_sig[offset: offset + sig_len]
+        offset += sig_len
+        pk_len, offset = _read_varint(script_sig, offset)
+        pk = script_sig[offset: offset + pk_len]
+        return sig, pk
+    except Exception as exc:
+        raise ScriptSigParseError(f"Failed to parse P2PQH scriptSig: {exc}") from exc
+
+
+def _parse_hybrid_scriptsig(script_sig: bytes, level: SecurityLevel) -> HybridSignature:
+    try:
+        data_len, offset = _read_varint(script_sig, 0)
+        payload = script_sig[offset: offset + data_len]
+        return HybridSignature.deserialise(payload, level)
+    except Exception as exc:
+        raise ScriptSigParseError(f"Failed to parse P2HPQ scriptSig: {exc}") from exc

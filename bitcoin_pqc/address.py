@@ -1,43 +1,54 @@
 """
-P2PQH — Pay to Post-Quantum Hash address scheme.
+Address derivation for P2PQH (pure ML-DSA) and P2HPQ (Hybrid ECDSA+ML-DSA).
 
-Address format (analogous to P2PKH / P2WPKH):
+  P2PQH  — Pay to Post-Quantum Hash
+            Commitment: RIPEMD160(SHA256(mldsa_pubkey))
+            Version:    0x30 mainnet / 0x6F testnet
 
-  P2PQH address = Base58Check( version_byte || RIPEMD160(SHA256(ml_dsa_pubkey)) )
+  P2HPQ  — Pay to Hybrid Post-Quantum Hash
+            Commitment: RIPEMD160(SHA256(ecdsa_pubkey || mldsa_pubkey))
+            Version:    0x31 mainnet / 0x70 testnet
 
-Version bytes (proposed, not yet assigned by Bitcoin Core):
-  0x30  mainnet P2PQH    →  addresses starting with "Q"
-  0x6f  testnet P2PQH    →  addresses starting with "q" (or numeric)
+Both use standard Base58Check encoding.
 
-Script pubkey (analogous to P2PKH locking script):
-  OP_PQH <20-byte pubkey hash> OP_EQUALVERIFY OP_PQCHECKSIG
-  (opcodes 0xc0, 0xc1 proposed — not yet allocated)
+Proposed locking scripts:
 
-For practical testing the library encodes addresses as standard Base58Check
-and emits human-readable script representations.
+  P2PQH:
+    OP_PQH <20> <hash> OP_EQUALVERIFY OP_PQCHECKSIG
+    (0xc0  0x14  <20B>  0x88           0xc1)
+
+  P2HPQ:
+    OP_PQH <20> <hash> OP_EQUALVERIFY OP_HPQCHECKSIG
+    (0xc0  0x14  <20B>  0x88           0xc2)
+    OP_HPQCHECKSIG verifies BOTH ECDSA and ML-DSA signatures.
 """
 
 from __future__ import annotations
 
 import hashlib
-import struct
 
-
-# ---------------------------------------------------------------------------
-# Base58 / Base58Check
-# ---------------------------------------------------------------------------
+from .exceptions import BadChecksumError, UnknownVersionError, AddressError
 
 _BASE58_ALPHABET = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
 
+MAINNET_P2PQH  = 0x30
+TESTNET_P2PQH  = 0x6F
+MAINNET_P2HPQ  = 0x31
+TESTNET_P2HPQ  = 0x70
+
+_KNOWN_VERSIONS = {MAINNET_P2PQH, TESTNET_P2PQH, MAINNET_P2HPQ, TESTNET_P2HPQ}
+
+
+# ---------------------------------------------------------------------------
+# Base58Check
+# ---------------------------------------------------------------------------
 
 def _b58encode(data: bytes) -> str:
-    """Encode bytes to Base58."""
     n = int.from_bytes(data, "big")
     result = []
     while n:
-        n, remainder = divmod(n, 58)
-        result.append(_BASE58_ALPHABET[remainder])
-    # Leading zero bytes → leading '1' characters
+        n, r = divmod(n, 58)
+        result.append(_BASE58_ALPHABET[r])
     for byte in data:
         if byte == 0:
             result.append(_BASE58_ALPHABET[0])
@@ -47,15 +58,16 @@ def _b58encode(data: bytes) -> str:
 
 
 def _b58decode(s: str) -> bytes:
-    """Decode a Base58 string to bytes."""
     n = 0
     for char in s:
-        n = n * 58 + _BASE58_ALPHABET.index(char.encode())
+        idx = _BASE58_ALPHABET.find(char.encode())
+        if idx == -1:
+            raise AddressError(f"Invalid Base58 character: '{char}'")
+        n = n * 58 + idx
     result = n.to_bytes((n.bit_length() + 7) // 8, "big") if n else b""
-    # Restore leading zeros
     pad = 0
-    for char in s:
-        if char == "1":
+    for c in s:
+        if c == "1":
             pad += 1
         else:
             break
@@ -67,78 +79,95 @@ def _checksum(payload: bytes) -> bytes:
 
 
 def b58check_encode(version: int, payload: bytes) -> str:
+    if not 0 <= version <= 255:
+        raise AddressError(f"Version byte out of range: {version}")
     prefix = bytes([version]) + payload
     return _b58encode(prefix + _checksum(prefix))
 
 
 def b58check_decode(address: str) -> tuple[int, bytes]:
-    """Return (version_byte, payload) or raise ValueError on bad checksum."""
+    if not address:
+        raise AddressError("Empty address string")
     raw = _b58decode(address)
     if len(raw) < 5:
-        raise ValueError("Address too short")
+        raise AddressError(f"Address too short ({len(raw)} bytes)")
     payload, check = raw[:-4], raw[-4:]
     if _checksum(payload) != check:
-        raise ValueError("Bad checksum")
+        raise BadChecksumError(f"Checksum mismatch for address '{address}'")
     return payload[0], payload[1:]
 
 
 # ---------------------------------------------------------------------------
-# P2PQH address derivation
+# Hash helpers
 # ---------------------------------------------------------------------------
 
-MAINNET_P2PQH_VERSION = 0x30   # proposed
-TESTNET_P2PQH_VERSION = 0x6F   # proposed (same as testnet P2PKH for convenience)
-
-
-def pubkey_to_address(
-    public_key: bytes,
-    testnet: bool = False,
-) -> str:
-    """
-    Derive a P2PQH address from a raw ML-DSA public key.
-
-    Steps:
-      1. SHA-256(pubkey)
-      2. RIPEMD-160 of step 1         → 20-byte pubkey hash
-      3. Base58Check with version byte → P2PQH address string
-    """
-    sha = hashlib.sha256(public_key).digest()
+def _hash160(data: bytes) -> bytes:
+    sha = hashlib.sha256(data).digest()
     r = hashlib.new("ripemd160")
     r.update(sha)
-    pubkey_hash = r.digest()
-
-    version = TESTNET_P2PQH_VERSION if testnet else MAINNET_P2PQH_VERSION
-    return b58check_encode(version, pubkey_hash)
+    return r.digest()
 
 
-def address_to_pubkey_hash(address: str) -> bytes:
-    """Decode a P2PQH address to its 20-byte pubkey hash."""
+# ---------------------------------------------------------------------------
+# Address derivation
+# ---------------------------------------------------------------------------
+
+def pubkey_to_address(public_key: bytes, testnet: bool = False) -> str:
+    """P2PQH address from a raw ML-DSA public key."""
+    if not public_key:
+        raise AddressError("public_key must be non-empty")
+    version = TESTNET_P2PQH if testnet else MAINNET_P2PQH
+    return b58check_encode(version, _hash160(public_key))
+
+
+def hybrid_pubkeys_to_address(
+    ecdsa_pubkey: bytes,
+    mldsa_pubkey: bytes,
+    testnet: bool = False,
+) -> str:
+    """P2HPQ address from a combined ECDSA + ML-DSA public key pair."""
+    if not ecdsa_pubkey or not mldsa_pubkey:
+        raise AddressError("Both ecdsa_pubkey and mldsa_pubkey must be non-empty")
+    version = TESTNET_P2HPQ if testnet else MAINNET_P2HPQ
+    combined = ecdsa_pubkey + mldsa_pubkey
+    return b58check_encode(version, _hash160(combined))
+
+
+def address_to_pubkey_hash(address: str) -> tuple[bytes, int]:
+    """Decode any P2PQH or P2HPQ address to (pubkey_hash, version)."""
     version, pubkey_hash = b58check_decode(address)
-    if version not in (MAINNET_P2PQH_VERSION, TESTNET_P2PQH_VERSION):
-        raise ValueError(f"Unknown address version byte: 0x{version:02x}")
+    if version not in _KNOWN_VERSIONS:
+        raise UnknownVersionError(f"Unknown address version byte: 0x{version:02x}")
     if len(pubkey_hash) != 20:
-        raise ValueError("Expected 20-byte pubkey hash")
-    return pubkey_hash
+        raise AddressError(f"Expected 20-byte hash, got {len(pubkey_hash)}")
+    return pubkey_hash, version
 
 
 def address_to_script_pubkey(address: str) -> bytes:
     """
-    Return the P2PQH locking script (scriptPubKey) for a given address.
+    Return the locking script (scriptPubKey) for a P2PQH or P2HPQ address.
 
-    Proposed opcodes:
-      0xc0  OP_PQH            (hash top-of-stack PQ pubkey, push result)
-      0x88  OP_EQUALVERIFY    (existing opcode reused)
-      0xc1  OP_PQCHECKSIG     (verify ML-DSA signature)
-
-    Encoded as: OP_PQH <push 20 bytes> <pubkey_hash> OP_EQUALVERIFY OP_PQCHECKSIG
+    P2PQH: OP_PQH(0xc0) push20(0x14) <hash> OP_EQUALVERIFY(0x88) OP_PQCHECKSIG(0xc1)
+    P2HPQ: OP_PQH(0xc0) push20(0x14) <hash> OP_EQUALVERIFY(0x88) OP_HPQCHECKSIG(0xc2)
     """
-    pubkey_hash = address_to_pubkey_hash(address)
-    return bytes([0xc0, 0x14]) + pubkey_hash + bytes([0x88, 0xc1])
+    pubkey_hash, version = address_to_pubkey_hash(address)
+    if version in (MAINNET_P2HPQ, TESTNET_P2HPQ):
+        checksig_op = 0xc2   # OP_HPQCHECKSIG — verifies both ECDSA + ML-DSA
+    else:
+        checksig_op = 0xc1   # OP_PQCHECKSIG  — verifies ML-DSA only
+    return bytes([0xc0, 0x14]) + pubkey_hash + bytes([0x88, checksig_op])
+
+
+def is_hybrid_address(address: str) -> bool:
+    """Return True if address is P2HPQ (hybrid), False if P2PQH (pure PQ)."""
+    _, version = address_to_pubkey_hash(address)
+    return version in (MAINNET_P2HPQ, TESTNET_P2HPQ)
 
 
 def script_pubkey_repr(script: bytes) -> str:
-    """Human-readable disassembly of a P2PQH scriptPubKey."""
-    if len(script) == 23 and script[0] == 0xc0 and script[1] == 0x14:
+    """Human-readable disassembly of a P2PQH or P2HPQ scriptPubKey."""
+    if len(script) == 24 and script[0] == 0xc0 and script[1] == 0x14:
         hash_hex = script[2:22].hex()
-        return f"OP_PQH OP_DATA_20 {hash_hex} OP_EQUALVERIFY OP_PQCHECKSIG"
+        op = "OP_HPQCHECKSIG" if script[23] == 0xc2 else "OP_PQCHECKSIG"
+        return f"OP_PQH OP_DATA_20 {hash_hex} OP_EQUALVERIFY {op}"
     return script.hex()

@@ -4,17 +4,22 @@ build-backend = "setuptools.backends.legacy:build"
 
 [project]
 name = "bitcoin-pqc"
-version = "0.1.0"
-description = "Post-quantum cryptography scheme for Bitcoin using ML-DSA (CRYSTALS-Dilithium)"
+version = "0.2.0"
+description = "Post-quantum cryptography for Bitcoin — hybrid ML-DSA + ECDSA signing, P2PQH/P2HPQ addresses, HD derivation, encrypted key storage"
 readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.9"
 dependencies = [
     "dilithium-py>=1.4.0",
+    "coincurve>=21.0.0",
+    "cryptography>=42.0.0",
 ]
 
 [project.optional-dependencies]
 dev = ["pytest"]
+
+[project.scripts]
+bitcoin-pqc = "bitcoin_pqc.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
