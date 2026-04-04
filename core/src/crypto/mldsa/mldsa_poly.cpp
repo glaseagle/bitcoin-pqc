@@ -11,19 +11,155 @@
 #include <stdint.h>
 #include <assert.h>
 
-// SHAKE-128/256 — we use Bitcoin Core's existing SHA3 implementation.
-// These wrappers are declared extern; the actual implementation is in
-// src/crypto/sha3.cpp which Bitcoin Core already ships.
-extern "C" {
-void shake128_absorb_once(uint64_t state[25], const uint8_t *in, size_t inlen);
-void shake128_squeezeblocks(uint8_t *out, size_t nblocks, uint64_t state[25]);
-void shake256_absorb_once(uint64_t state[25], const uint8_t *in, size_t inlen);
-void shake256_squeezeblocks(uint8_t *out, size_t nblocks, uint64_t state[25]);
-void shake256(uint8_t *out, size_t outlen, const uint8_t *in, size_t inlen);
-}
-
 #define SHAKE128_RATE 168
 #define SHAKE256_RATE 136
+
+struct keccak_state {
+    uint64_t s[25];
+    size_t pos;
+};
+
+namespace {
+
+static uint64_t Load64(const uint8_t* in)
+{
+    uint64_t x = 0;
+    for (int i = 0; i < 8; ++i) {
+        x |= static_cast<uint64_t>(in[i]) << (8 * i);
+    }
+    return x;
+}
+
+static void Store64(uint8_t* out, uint64_t x)
+{
+    for (int i = 0; i < 8; ++i) {
+        out[i] = static_cast<uint8_t>(x >> (8 * i));
+    }
+}
+
+static uint64_t RotL64(uint64_t x, unsigned int n)
+{
+    return (x << n) | (x >> (64 - n));
+}
+
+static void KeccakF1600(keccak_state* state)
+{
+    static const uint64_t RC[24] = {
+        0x0000000000000001ULL, 0x0000000000008082ULL,
+        0x800000000000808aULL, 0x8000000080008000ULL,
+        0x000000000000808bULL, 0x0000000080000001ULL,
+        0x8000000080008081ULL, 0x8000000000008009ULL,
+        0x000000000000008aULL, 0x0000000000000088ULL,
+        0x0000000080008009ULL, 0x000000008000000aULL,
+        0x000000008000808bULL, 0x800000000000008bULL,
+        0x8000000000008089ULL, 0x8000000000008003ULL,
+        0x8000000000008002ULL, 0x8000000000000080ULL,
+        0x000000000000800aULL, 0x800000008000000aULL,
+        0x8000000080008081ULL, 0x8000000000008080ULL,
+        0x0000000080000001ULL, 0x8000000080008008ULL,
+    };
+    static const unsigned int R[25] = {
+         0,  1, 62, 28, 27,
+        36, 44,  6, 55, 20,
+         3, 10, 43, 25, 39,
+        41, 45, 15, 21,  8,
+        18,  2, 61, 56, 14,
+    };
+
+    uint64_t* a = state->s;
+    uint64_t b[25];
+    uint64_t c[5];
+    uint64_t d[5];
+
+    for (int round = 0; round < 24; ++round) {
+        for (int x = 0; x < 5; ++x) {
+            c[x] = a[x] ^ a[x + 5] ^ a[x + 10] ^ a[x + 15] ^ a[x + 20];
+        }
+        for (int x = 0; x < 5; ++x) {
+            d[x] = c[(x + 4) % 5] ^ RotL64(c[(x + 1) % 5], 1);
+        }
+        for (int x = 0; x < 5; ++x) {
+            for (int y = 0; y < 5; ++y) {
+                a[x + 5 * y] ^= d[x];
+            }
+        }
+
+        for (int x = 0; x < 5; ++x) {
+            for (int y = 0; y < 5; ++y) {
+                const int src = x + 5 * y;
+                const int dst = y + 5 * ((2 * x + 3 * y) % 5);
+                b[dst] = RotL64(a[src], R[src]);
+            }
+        }
+
+        for (int x = 0; x < 5; ++x) {
+            for (int y = 0; y < 5; ++y) {
+                a[x + 5 * y] = b[x + 5 * y] ^
+                    ((~b[((x + 1) % 5) + 5 * y]) & b[((x + 2) % 5) + 5 * y]);
+            }
+        }
+
+        a[0] ^= RC[round];
+    }
+}
+
+static void KeccakAbsorbOnce(keccak_state* state, size_t rate, const uint8_t* in, size_t inlen)
+{
+    memset(state, 0, sizeof(*state));
+
+    while (inlen >= rate) {
+        for (size_t i = 0; i < rate / 8; ++i) {
+            state->s[i] ^= Load64(in + 8 * i);
+        }
+        KeccakF1600(state);
+        in += rate;
+        inlen -= rate;
+    }
+
+    uint8_t block[SHAKE128_RATE] = {0};
+    if (inlen != 0) {
+        memcpy(block, in, inlen);
+    }
+    block[inlen] = 0x1F;
+    block[rate - 1] |= 0x80;
+    for (size_t i = 0; i < rate / 8; ++i) {
+        state->s[i] ^= Load64(block + 8 * i);
+    }
+    state->pos = rate;
+}
+
+static void KeccakSqueezeBlocks(uint8_t* out, size_t nblocks, size_t rate, keccak_state* state)
+{
+    while (nblocks-- > 0) {
+        if (state->pos == rate) {
+            KeccakF1600(state);
+            state->pos = 0;
+        }
+        for (size_t i = 0; i < rate / 8; ++i) {
+            Store64(out + 8 * i, state->s[i]);
+        }
+        out += rate;
+        state->pos = rate;
+    }
+}
+
+} // namespace
+
+void shake128_absorb_once(keccak_state *state, const uint8_t *in, size_t inlen) {
+    KeccakAbsorbOnce(state, SHAKE128_RATE, in, inlen);
+}
+
+void shake128_squeezeblocks(uint8_t *out, size_t nblocks, keccak_state *state) {
+    KeccakSqueezeBlocks(out, nblocks, SHAKE128_RATE, state);
+}
+
+void shake256_absorb_once(keccak_state *state, const uint8_t *in, size_t inlen) {
+    KeccakAbsorbOnce(state, SHAKE256_RATE, in, inlen);
+}
+
+void shake256_squeezeblocks(uint8_t *out, size_t nblocks, keccak_state *state) {
+    KeccakSqueezeBlocks(out, nblocks, SHAKE256_RATE, state);
+}
 
 // NTT zeta table (precomputed for q = 8380417, root of unity ζ = 1753)
 // Generated with: ζ^(BitRev(i)) mod q for i = 0..255
@@ -231,15 +367,15 @@ int mldsa_poly_chknorm(const mldsa_poly *a, int32_t b) {
 
 void mldsa_poly_uniform(mldsa_poly *a, const uint8_t seed[MLDSA_SEEDBYTES], uint16_t nonce) {
     uint8_t buf[SHAKE128_RATE * 5];
-    uint64_t state[25];
+    keccak_state state;
 
     uint8_t extseed[MLDSA_SEEDBYTES + 2];
     memcpy(extseed, seed, MLDSA_SEEDBYTES);
     extseed[MLDSA_SEEDBYTES]     = (uint8_t)nonce;
     extseed[MLDSA_SEEDBYTES + 1] = (uint8_t)(nonce >> 8);
 
-    shake128_absorb_once(state, extseed, sizeof(extseed));
-    shake128_squeezeblocks(buf, 5, state);
+    shake128_absorb_once(&state, extseed, sizeof(extseed));
+    shake128_squeezeblocks(buf, 5, &state);
 
     unsigned int ctr = 0, pos = 0;
     while (ctr < MLDSA_N) {
@@ -249,7 +385,7 @@ void mldsa_poly_uniform(mldsa_poly *a, const uint8_t seed[MLDSA_SEEDBYTES], uint
             a->coeffs[ctr++] = t;
         pos += 3;
         if (pos > sizeof(buf) - 3) {
-            shake128_squeezeblocks(buf, 1, state);
+            shake128_squeezeblocks(buf, 1, &state);
             pos = 0;
         }
     }
@@ -259,15 +395,15 @@ void mldsa_poly_uniform(mldsa_poly *a, const uint8_t seed[MLDSA_SEEDBYTES], uint
 
 void mldsa_poly_uniform_eta(mldsa_poly *a, const uint8_t seed[MLDSA_CRHBYTES], uint16_t nonce) {
     uint8_t buf[SHAKE256_RATE * 2];
-    uint64_t state[25];
+    keccak_state state;
 
     uint8_t extseed[MLDSA_CRHBYTES + 2];
     memcpy(extseed, seed, MLDSA_CRHBYTES);
     extseed[MLDSA_CRHBYTES]     = (uint8_t)nonce;
     extseed[MLDSA_CRHBYTES + 1] = (uint8_t)(nonce >> 8);
 
-    shake256_absorb_once(state, extseed, sizeof(extseed));
-    shake256_squeezeblocks(buf, 2, state);
+    shake256_absorb_once(&state, extseed, sizeof(extseed));
+    shake256_squeezeblocks(buf, 2, &state);
 
     unsigned int ctr = 0, pos = 0;
     while (ctr < MLDSA_N) {
@@ -278,7 +414,7 @@ void mldsa_poly_uniform_eta(mldsa_poly *a, const uint8_t seed[MLDSA_CRHBYTES], u
         if (t0 < 9) a->coeffs[ctr++] = (int32_t)MLDSA_ETA - t0;
         if (t1 < 9 && ctr < MLDSA_N) a->coeffs[ctr++] = (int32_t)MLDSA_ETA - t1;
         if (pos >= sizeof(buf)) {
-            shake256_squeezeblocks(buf, 1, state);
+            shake256_squeezeblocks(buf, 1, &state);
             pos = 0;
         }
     }
@@ -288,26 +424,26 @@ void mldsa_poly_uniform_eta(mldsa_poly *a, const uint8_t seed[MLDSA_CRHBYTES], u
 
 void mldsa_poly_uniform_gamma1(mldsa_poly *a, const uint8_t seed[MLDSA_CRHBYTES], uint16_t nonce) {
     uint8_t buf[MLDSA_POLYZ_PACKEDBYTES];
-    uint64_t state[25];
+    keccak_state state;
 
     uint8_t extseed[MLDSA_CRHBYTES + 2];
     memcpy(extseed, seed, MLDSA_CRHBYTES);
     extseed[MLDSA_CRHBYTES]     = (uint8_t)nonce;
     extseed[MLDSA_CRHBYTES + 1] = (uint8_t)(nonce >> 8);
 
-    shake256_absorb_once(state, extseed, sizeof(extseed));
-    shake256_squeezeblocks(buf, MLDSA_POLYZ_PACKEDBYTES / SHAKE256_RATE + 1, state);
+    shake256_absorb_once(&state, extseed, sizeof(extseed));
+    shake256_squeezeblocks(buf, MLDSA_POLYZ_PACKEDBYTES / SHAKE256_RATE + 1, &state);
     mldsa_poly_unpack_z(a, buf);
 }
 
 // ---- Challenge polynomial c ----
 
 void mldsa_poly_challenge(mldsa_poly *c, const uint8_t seed[MLDSA_LAMBDA/8]) {
-    uint64_t state[25];
-    shake256_absorb_once(state, seed, MLDSA_LAMBDA/8);
+    keccak_state state;
+    shake256_absorb_once(&state, seed, MLDSA_LAMBDA/8);
 
     uint8_t buf[SHAKE256_RATE];
-    shake256_squeezeblocks(buf, 1, state);
+    shake256_squeezeblocks(buf, 1, &state);
 
     memset(c->coeffs, 0, sizeof(c->coeffs));
 
@@ -320,7 +456,7 @@ void mldsa_poly_challenge(mldsa_poly *c, const uint8_t seed[MLDSA_LAMBDA/8]) {
         unsigned int b;
         do {
             if (pos >= SHAKE256_RATE) {
-                shake256_squeezeblocks(buf, 1, state);
+                shake256_squeezeblocks(buf, 1, &state);
                 pos = 0;
             }
             b = buf[pos++];

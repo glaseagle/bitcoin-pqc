@@ -19,7 +19,7 @@
 // Weight of c in signing
 #define MLDSA_TAU     49
 // Collision strength of commitment
-#define MLDSA_LAMBDA  256
+#define MLDSA_LAMBDA  128
 // Dimensions of A
 #define MLDSA_K       6
 #define MLDSA_L       5
