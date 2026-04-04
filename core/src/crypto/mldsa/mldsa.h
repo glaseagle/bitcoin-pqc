@@ -16,10 +16,13 @@
 #include <span>
 #include <array>
 
-// Key and signature sizes
-static constexpr size_t MLDSA_PUBKEY_SIZE  = 1952;
-static constexpr size_t MLDSA_SECKEY_SIZE  = 4000;
-static constexpr size_t MLDSA_SIG_SIZE     = 3293;
+#include "mldsa_params.h"
+
+// Key and signature sizes (FIPS 204 Table 2, ML-DSA-65)
+// sk = 2*32 + 64 + L*128 + K*128 + K*416 = 64+64+640+768+2496 = 4032 bytes
+static constexpr size_t MLDSA_PUBKEY_SIZE  = MLDSA_PUBLICKEYBYTES;
+static constexpr size_t MLDSA_SECKEY_SIZE  = MLDSA_SECRETKEYBYTES;
+static constexpr size_t MLDSA_SIG_SIZE     = MLDSA_SIGNBYTES;
 
 using MLDSAPublicKey  = std::array<uint8_t, MLDSA_PUBKEY_SIZE>;
 using MLDSASecretKey  = std::array<uint8_t, MLDSA_SECKEY_SIZE>;

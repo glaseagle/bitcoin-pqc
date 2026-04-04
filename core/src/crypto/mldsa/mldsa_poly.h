@@ -19,6 +19,11 @@ typedef struct {
 typedef struct { mldsa_poly vec[MLDSA_L]; } mldsa_polyvecl;
 typedef struct { mldsa_poly vec[MLDSA_K]; } mldsa_polyveck;
 
+typedef struct {
+    uint64_t s[25];
+    size_t pos;
+} keccak_state;
+
 // ---- Reduction ----
 int32_t mldsa_montgomery_reduce(int64_t a);
 int32_t mldsa_reduce32(int32_t a);
@@ -46,7 +51,8 @@ int mldsa_poly_chknorm(const mldsa_poly *a, int32_t b);
 void mldsa_poly_uniform(mldsa_poly *a, const uint8_t seed[MLDSA_SEEDBYTES], uint16_t nonce);
 void mldsa_poly_uniform_eta(mldsa_poly *a, const uint8_t seed[MLDSA_CRHBYTES], uint16_t nonce);
 void mldsa_poly_uniform_gamma1(mldsa_poly *a, const uint8_t seed[MLDSA_CRHBYTES], uint16_t nonce);
-void mldsa_poly_challenge(mldsa_poly *c, const uint8_t seed[MLDSA_LAMBDA/8]);
+void mldsa_poly_challenge(mldsa_poly *c, const uint8_t seed[MLDSA_CTILDEBYTES]);
+void shake256(uint8_t *out, size_t outlen, const uint8_t *in, size_t inlen);
 
 // ---- Packing ----
 void mldsa_poly_pack_t1(uint8_t *r, const mldsa_poly *a);
@@ -67,6 +73,7 @@ void mldsa_polyvecl_ntt(mldsa_polyvecl *v);
 void mldsa_polyveck_ntt(mldsa_polyveck *v);
 void mldsa_polyvecl_invntt_tomont(mldsa_polyvecl *v);
 void mldsa_polyveck_invntt_tomont(mldsa_polyveck *v);
+void mldsa_polyvecl_pointwise_poly_montgomery(mldsa_polyvecl *r, const mldsa_poly *a, const mldsa_polyvecl *v);
 void mldsa_polyveck_pointwise_poly_montgomery(mldsa_polyveck *r, const mldsa_poly *a, const mldsa_polyveck *v);
 void mldsa_polyvecl_pointwise_acc_montgomery(mldsa_poly *w, const mldsa_polyvecl *u, const mldsa_polyvecl *v);
 void mldsa_polyveck_add(mldsa_polyveck *w, const mldsa_polyveck *u, const mldsa_polyveck *v);

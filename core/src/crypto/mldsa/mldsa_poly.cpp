@@ -7,17 +7,13 @@
 
 #include "mldsa_poly.h"
 #include "mldsa_params.h"
+#include <algorithm>
 #include <string.h>
 #include <stdint.h>
 #include <assert.h>
 
 #define SHAKE128_RATE 168
 #define SHAKE256_RATE 136
-
-struct keccak_state {
-    uint64_t s[25];
-    size_t pos;
-};
 
 namespace {
 
@@ -159,6 +155,20 @@ void shake256_absorb_once(keccak_state *state, const uint8_t *in, size_t inlen) 
 
 void shake256_squeezeblocks(uint8_t *out, size_t nblocks, keccak_state *state) {
     KeccakSqueezeBlocks(out, nblocks, SHAKE256_RATE, state);
+}
+
+void shake256(uint8_t *out, size_t outlen, const uint8_t *in, size_t inlen) {
+    keccak_state state;
+    uint8_t buf[SHAKE256_RATE];
+    size_t produced = 0;
+
+    shake256_absorb_once(&state, in, inlen);
+    while (produced < outlen) {
+        shake256_squeezeblocks(buf, 1, &state);
+        const size_t chunk = std::min(outlen - produced, static_cast<size_t>(SHAKE256_RATE));
+        memcpy(out + produced, buf, chunk);
+        produced += chunk;
+    }
 }
 
 // NTT zeta table (precomputed for q = 8380417, root of unity ζ = 1753)
@@ -423,7 +433,8 @@ void mldsa_poly_uniform_eta(mldsa_poly *a, const uint8_t seed[MLDSA_CRHBYTES], u
 // ---- Uniform sampling for mask (GAMMA1 = 2^19) ----
 
 void mldsa_poly_uniform_gamma1(mldsa_poly *a, const uint8_t seed[MLDSA_CRHBYTES], uint16_t nonce) {
-    uint8_t buf[MLDSA_POLYZ_PACKEDBYTES];
+    constexpr size_t GAMMA1_BLOCKS = (MLDSA_POLYZ_PACKEDBYTES + SHAKE256_RATE - 1) / SHAKE256_RATE;
+    uint8_t buf[GAMMA1_BLOCKS * SHAKE256_RATE];
     keccak_state state;
 
     uint8_t extseed[MLDSA_CRHBYTES + 2];
@@ -432,15 +443,15 @@ void mldsa_poly_uniform_gamma1(mldsa_poly *a, const uint8_t seed[MLDSA_CRHBYTES]
     extseed[MLDSA_CRHBYTES + 1] = (uint8_t)(nonce >> 8);
 
     shake256_absorb_once(&state, extseed, sizeof(extseed));
-    shake256_squeezeblocks(buf, MLDSA_POLYZ_PACKEDBYTES / SHAKE256_RATE + 1, &state);
+    shake256_squeezeblocks(buf, GAMMA1_BLOCKS, &state);
     mldsa_poly_unpack_z(a, buf);
 }
 
 // ---- Challenge polynomial c ----
 
-void mldsa_poly_challenge(mldsa_poly *c, const uint8_t seed[MLDSA_LAMBDA/8]) {
+void mldsa_poly_challenge(mldsa_poly *c, const uint8_t seed[MLDSA_CTILDEBYTES]) {
     keccak_state state;
-    shake256_absorb_once(&state, seed, MLDSA_LAMBDA/8);
+    shake256_absorb_once(&state, seed, MLDSA_CTILDEBYTES);
 
     uint8_t buf[SHAKE256_RATE];
     shake256_squeezeblocks(buf, 1, &state);
@@ -621,6 +632,11 @@ void mldsa_polyvecl_invntt_tomont(mldsa_polyvecl *v) {
 }
 void mldsa_polyveck_invntt_tomont(mldsa_polyveck *v) {
     for (int i = 0; i < MLDSA_K; ++i) mldsa_poly_invntt_tomont(&v->vec[i]);
+}
+
+void mldsa_polyvecl_pointwise_poly_montgomery(mldsa_polyvecl *r, const mldsa_poly *a, const mldsa_polyvecl *v) {
+    for (int i = 0; i < MLDSA_L; ++i)
+        mldsa_poly_pointwise_montgomery(&r->vec[i], a, &v->vec[i]);
 }
 
 void mldsa_polyveck_pointwise_poly_montgomery(mldsa_polyveck *r, const mldsa_poly *a, const mldsa_polyveck *v) {
