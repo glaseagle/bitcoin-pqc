@@ -56,7 +56,7 @@ Points worth special attention:
 - Falcon-512 (NIST FIPS 206) would be ~3.4× more compact — open design question
 - Wallet signing not yet wired (consensus + policy layer only)
 - NIST byte-level KAT vectors still needed (current tests are roundtrip, not conformance)
-- `getdeploymentinfo` RPC needs "pqc" status string entry
+- ~~`getdeploymentinfo` RPC needs "pqc" status string entry~~ — fixed (3a288fc)
 
 ## Benchmarks
 
